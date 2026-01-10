@@ -96,20 +96,20 @@ class CodeGraph:
         
         G = nx.MultiDiGraph()
         for tag in tags:
-            G.add_node(tag['name'], category=tag['category'], info=tag['info'], fname=tag['fname'], line=tag['line'], kind=tag['kind'])
+            G.add_node(tag.name, category=tag['category'], info=tag['info'], fname=tag['fname'], line=tag['line'], kind=tag['kind'])
 
         for tag in tags:
             if tag['category'] == 'class':
                 class_funcs = tag['info'].split('\t')
                 for f in class_funcs:
-                    G.add_edge(tag['name'], f.strip())
+                    G.add_edge(tag.name, f.strip())
 
         tags_ref = [tag for tag in tags if tag['kind'] == 'ref']
         tags_def = [tag for tag in tags if tag['kind'] == 'def']
         for tag in tags_ref:
             for tag_def in tags_def:
-                if tag['name'] == tag_def['name']:
-                    G.add_edge(tag['name'], tag_def['name'])
+                if tag.name == tag_def['name']:
+                    G.add_edge(tag.name, tag_def['name'])
         return G
 
     def get_rel_fname(self, fname):
@@ -216,6 +216,8 @@ class CodeGraph:
     def get_tags_raw(self, fname, rel_fname):
         ref_fname_lst = rel_fname.split('/')
         s = deepcopy(self.structure)
+        if len(ref_fname_lst) == 1:
+            s = s[self.root.split('/')[-1]]
         for fname_part in ref_fname_lst:
             s = s[fname_part]
         structure_classes = {item['name']: item for item in s['classes']}
