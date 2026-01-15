@@ -385,13 +385,27 @@ class CodeGraph:
 
             elif category == 'function':
 
+                # if kind == 'def':
+                #     # func_block = self.get_func_block(cur_cdl, code)
+                #     # cur_cdl =func_block
+                #     cur_cdl = '\n'.join(structure_all_funcs[tag_name]['text'])
+                #     line_nums = [structure_all_funcs[tag_name]['start_line'], structure_all_funcs[tag_name]['end_line']]
+                # else:
+                #     line_nums = [node.start_point[0], node.end_point[0]]
                 if kind == 'def':
-                    # func_block = self.get_func_block(cur_cdl, code)
-                    # cur_cdl =func_block
-                    cur_cdl = '\n'.join(structure_all_funcs[tag_name]['text'])
-                    line_nums = [structure_all_funcs[tag_name]['start_line'], structure_all_funcs[tag_name]['end_line']]
+                    info = structure_all_funcs.get(tag_name)
+                    if info is not None:
+                        cur_cdl = '\n'.join(info.get('text', []))
+                        line_nums = [info.get('start_line', node.start_point[0]),
+                                    info.get('end_line', node.end_point[0])]
+                    else:
+                        # fallback：别崩
+                        cur_cdl = codelines[node.start_point[0]].rstrip('\n')
+                        line_nums = [node.start_point[0], node.end_point[0]]
                 else:
                     line_nums = [node.start_point[0], node.end_point[0]]
+                    cur_cdl = codelines[node.start_point[0]].rstrip('\n')
+
 
                 result = Tag(
                     idx = self.num_tags,
