@@ -575,14 +575,63 @@ class CodeGraph:
         return output
 
 
+    # def find_src_files(self, directory):
+    #     if not os.path.isdir(directory):
+    #         return [directory]
+
+    #     src_files = []
+    #     for root, dirs, files in os.walk(directory):
+    #         for file in files:
+    #             src_files.append(os.path.join(root, file))
+    #     return src_files
+    
+
     def find_src_files(self, directory):
+        # If it's a file, just return it
         if not os.path.isdir(directory):
             return [directory]
 
+        # Directories to skip entirely (huge speedup / reduce noise)
+        SKIP_DIRS = {
+            ".git", "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+            ".tox", ".idea", ".vscode",
+            "dist", ".eggs",
+            "venv", ".venv", "env", ".env",
+            "site-packages", "dist-packages",
+            "node_modules", 
+            "data_passk_platform","data_passk_platform1",
+        }
+
+        # Skip file patterns
+        SKIP_FILE_SUFFIXES = {
+            ".pyc", ".pyo", ".pyd",
+            ".so", ".dll", ".dylib",
+            ".zip", ".tar", ".gz", ".bz2", ".xz",
+        }
+
         src_files = []
         for root, dirs, files in os.walk(directory):
+            # Prune directories in-place so os.walk won't descend into them
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+
+            # Extra safety: prune if any path component is a skip dir
+            # (handles nested venv/site-packages even if renamed oddly)
+            parts = set(root.split(os.sep))
+            if parts & SKIP_DIRS:
+                continue
+
             for file in files:
+                # Skip obvious binary / cache artifacts
+                _, ext = os.path.splitext(file)
+                if ext in SKIP_FILE_SUFFIXES:
+                    continue
+
+                # Skip hidden files
+                if file.startswith("."):
+                    continue
+
                 src_files.append(os.path.join(root, file))
+
         return src_files
     
 
