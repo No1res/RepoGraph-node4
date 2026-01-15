@@ -377,6 +377,7 @@ class CodeGraph:
                     line_nums = [node.start_point[0], node.end_point[0]]
 
                 result = Tag(
+                    idx = self.num_tags,
                     rel_fname=rel_fname,
                     fname=fname,
                     name=tag_name,
