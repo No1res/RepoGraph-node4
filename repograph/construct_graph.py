@@ -222,9 +222,11 @@ class CodeGraph:
 
     def get_tags_raw(self, fname, rel_fname):
         ref_fname_lst = rel_fname.split('/')
+
+        s = deepcopy(self.structure)
         if len(ref_fname_lst) == 1:
             s = s[self.root.split('/')[-1]]
-        s = deepcopy(self.structure)
+            
         for fname_part in ref_fname_lst:
             if fname_part not in s:
                 return
