@@ -655,25 +655,38 @@ def list_subrepos(parent_dir: str):
     # print(f"🏅 Successfully cached code graph and node tags in directory ''{os.getcwd()}''")
 
 if __name__ == "__main__":
-    parent_dir = sys.argv[1]          # 多 repo 的父目录
+    # 用法：
+    #   python construct_graph.py <parent_dir> [out_dir]
+    # 其中 parent_dir 的每个一级子目录都是一个 repo
+
+    def list_subrepos(parent_dir: str):
+        subrepos = []
+        for name in sorted(os.listdir(parent_dir)):
+            p = os.path.join(parent_dir, name)
+            if os.path.isdir(p):
+                subrepos.append(p)
+        return subrepos
+
+    parent_dir = sys.argv[1]  # 多 repo 的父目录（每个一级子目录=repo）
     out_dir = sys.argv[2] if len(sys.argv) > 2 else os.getcwd()
 
     os.makedirs(out_dir, exist_ok=True)
 
-    for repo_dir in list_subrepos(parent_dir):
+    repos = list_subrepos(parent_dir)
+
+    # 外层：repo 进度条
+    for repo_dir in tqdm(repos, desc="Repos", unit="repo"):
         repo_id = os.path.basename(repo_dir.rstrip("/"))
-        print(f"\n=== Building graph for repo: {repo_id} ({repo_dir}) ===")
+        tqdm.write(f"\n=== Building graph for repo: {repo_id} ({repo_dir}) ===")
 
         code_graph = CodeGraph(root=repo_dir)
+
         # 你用了 idx 的话必须初始化
-        if not hasattr(code_graph, "num_tags"):
-            code_graph.num_tags = 0
-        else:
-            code_graph.num_tags = 0
+        code_graph.num_tags = 0
 
         files = code_graph.find_files([repo_dir])
         if not files:
-            print(f"  [skip] no .py files found in {repo_id}")
+            tqdm.write(f"  [skip] no .py files found in {repo_id}")
             continue
 
         tags, G = code_graph.get_code_graph(files)
@@ -683,23 +696,25 @@ if __name__ == "__main__":
         with open(graph_path, "wb") as f:
             pickle.dump(G, f)
 
-        # 2) tags：建议写成标准 JSON list（方便 json.load），别写 jsonl
+        # 2) tags：标准 JSON list（方便 json.load），不要写 jsonl
         tags_dump = []
         for t in tags:
-            tags_dump.append({
-                "idx": t.idx,
-                "fname": t.fname,
-                "rel_fname": t.rel_fname,
-                "line": t.line,
-                "name": t.name,
-                "kind": t.kind,
-                "category": t.category,
-                "info": t.info,
-            })
+            tags_dump.append(
+                {
+                    "idx": t.idx,
+                    "fname": t.fname,
+                    "rel_fname": t.rel_fname,
+                    "line": t.line,
+                    "name": t.name,
+                    "kind": t.kind,
+                    "category": t.category,
+                    "info": t.info,
+                }
+            )
         tags_path = os.path.join(out_dir, f"tags_{repo_id}.json")
         with open(tags_path, "w", encoding="utf-8") as f:
             json.dump(tags_dump, f, ensure_ascii=False)
 
-        print(f"  ✅ nodes={len(G.nodes)} edges={len(G.edges)}")
-        print(f"  wrote: {graph_path}")
-        print(f"  wrote: {tags_path}")
+        tqdm.write(f"  ✅ nodes={len(G.nodes)} edges={len(G.edges)}")
+        tqdm.write(f"  wrote: {graph_path}")
+        tqdm.write(f"  wrote: {tags_path}")
