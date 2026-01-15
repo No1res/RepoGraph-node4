@@ -59,6 +59,7 @@ class CodeGraph:
         # self.token_count = main_model.token_count
         self.repo_content_prefix = repo_content_prefix
         self.structure = create_structure(self.root)
+        self.num_tags = 0
 
     def get_code_graph(self, other_files, mentioned_fnames=None):
         if self.max_map_tokens <= 0:
@@ -386,6 +387,7 @@ class CodeGraph:
                     info=cur_cdl,
                     line=line_nums,
                 )
+                self.num_tags += 1
 
             yield result
 
@@ -408,6 +410,7 @@ class CodeGraph:
 
         for token in tokens:
             yield Tag(
+                idx = self.num_tags,
                 rel_fname=rel_fname,
                 fname=fname,
                 name=token,
@@ -416,6 +419,7 @@ class CodeGraph:
                 category='function',
                 info='none',
             )
+            self.num_tags += 1
 
     def get_ranked_tags(self, other_fnames, mentioned_fnames):
         # defines = defaultdict(set)
