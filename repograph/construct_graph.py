@@ -612,35 +612,94 @@ def get_random_color():
     res = f"#{r:02x}{g:02x}{b:02x}"
     return res
 
+def list_subrepos(parent_dir: str):
+    subrepos = []
+    for name in sorted(os.listdir(parent_dir)):
+        p = os.path.join(parent_dir, name)
+        if os.path.isdir(p):
+            subrepos.append(p)
+    return subrepos
+
+
+
+# if __name__ == "__main__":
+
+    # dir_name = sys.argv[1]
+    # # dir_name = "./playground/astropy"
+    # code_graph = CodeGraph(root=dir_name)
+    # chat_fnames_new = code_graph.find_files([dir_name])
+
+    # tags, G = code_graph.get_code_graph(chat_fnames_new)
+
+    # print("---------------------------------")
+    # print(f"🏅 Successfully constructed the code graph for repo directory {dir_name}")
+    # print(f"   Number of nodes: {len(G.nodes)}")
+    # print(f"   Number of edges: {len(G.edges)}")
+    # print("---------------------------------")
+
+    # with open(f'{os.getcwd()}/graph.pkl', 'wb') as f:
+    #     pickle.dump(G, f)
+    
+    # for tag in tags:
+    #     with open(f'{os.getcwd()}/tags.json', 'a+') as f:
+    #         line = json.dumps({
+    #             "fname": tag.fname,
+    #             'rel_fname': tag.rel_fname,
+    #             'line': tag.line,
+    #             'name': tag.name,
+    #             'kind': tag.kind,
+    #             'category': tag.category,
+    #             'info': tag.info,
+    #         })
+    #         f.write(line+'\n')
+    # print(f"🏅 Successfully cached code graph and node tags in directory ''{os.getcwd()}''")
 
 if __name__ == "__main__":
+    parent_dir = sys.argv[1]          # 多 repo 的父目录
+    out_dir = sys.argv[2] if len(sys.argv) > 2 else os.getcwd()
 
-    dir_name = sys.argv[1]
-    # dir_name = "./playground/astropy"
-    code_graph = CodeGraph(root=dir_name)
-    chat_fnames_new = code_graph.find_files([dir_name])
+    os.makedirs(out_dir, exist_ok=True)
 
-    tags, G = code_graph.get_code_graph(chat_fnames_new)
+    for repo_dir in list_subrepos(parent_dir):
+        repo_id = os.path.basename(repo_dir.rstrip("/"))
+        print(f"\n=== Building graph for repo: {repo_id} ({repo_dir}) ===")
 
-    print("---------------------------------")
-    print(f"🏅 Successfully constructed the code graph for repo directory {dir_name}")
-    print(f"   Number of nodes: {len(G.nodes)}")
-    print(f"   Number of edges: {len(G.edges)}")
-    print("---------------------------------")
+        code_graph = CodeGraph(root=repo_dir)
+        # 你用了 idx 的话必须初始化
+        if not hasattr(code_graph, "num_tags"):
+            code_graph.num_tags = 0
+        else:
+            code_graph.num_tags = 0
 
-    with open(f'{os.getcwd()}/graph.pkl', 'wb') as f:
-        pickle.dump(G, f)
-    
-    for tag in tags:
-        with open(f'{os.getcwd()}/tags.json', 'a+') as f:
-            line = json.dumps({
-                "fname": tag.fname,
-                'rel_fname': tag.rel_fname,
-                'line': tag.line,
-                'name': tag.name,
-                'kind': tag.kind,
-                'category': tag.category,
-                'info': tag.info,
+        files = code_graph.find_files([repo_dir])
+        if not files:
+            print(f"  [skip] no .py files found in {repo_id}")
+            continue
+
+        tags, G = code_graph.get_code_graph(files)
+
+        # 1) 图
+        graph_path = os.path.join(out_dir, f"{repo_id}.pkl")
+        with open(graph_path, "wb") as f:
+            pickle.dump(G, f)
+
+        # 2) tags：建议写成标准 JSON list（方便 json.load），别写 jsonl
+        tags_dump = []
+        for t in tags:
+            tags_dump.append({
+                "idx": t.idx,
+                "fname": t.fname,
+                "rel_fname": t.rel_fname,
+                "line": t.line,
+                "name": t.name,
+                "kind": t.kind,
+                "category": t.category,
+                "info": t.info,
             })
-            f.write(line+'\n')
-    print(f"🏅 Successfully cached code graph and node tags in directory ''{os.getcwd()}''")
+        tags_path = os.path.join(out_dir, f"tags_{repo_id}.json")
+        with open(tags_path, "w", encoding="utf-8") as f:
+            json.dump(tags_dump, f, ensure_ascii=False)
+
+        print(f"  ✅ nodes={len(G.nodes)} edges={len(G.edges)}")
+        print(f"  wrote: {graph_path}")
+        print(f"  wrote: {tags_path}")
