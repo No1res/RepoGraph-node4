@@ -107,8 +107,9 @@ class CodeGraph:
                         n for n, attr in G.nodes(data=True)
                         if attr.get('name') == f.strip() and attr.get('kind') == 'def'
                     ]
-                    edges = [(tag.idx, v) for v in target_nodes if v != tag.idx]
-                    G.add_edge(tag.name, f.strip())
+                    for v in target_nodes:
+                        if v != tag.idx:
+                            G.add_edge(tag.idx, v)
 
         tags_ref = [tag for tag in tags if tag.kind == 'ref']
         tags_def = [tag for tag in tags if tag.kind == 'def']
