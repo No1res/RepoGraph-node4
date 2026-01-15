@@ -339,10 +339,25 @@ class CodeGraph:
             if category == 'class':
                 if tag_name in structure_classes:
                     class_functions = [item['name'] for item in structure_classes[tag_name]['methods']]
+
+                    # if kind == 'def':
+                    #     line_nums = [structure_classes[tag_name]['start_line'], structure_classes[tag_name]['end_line']]
+                    # else:
+                    #     line_nums = [node.start_point[0], node.end_point[0]]
+
                     if kind == 'def':
-                        line_nums = [structure_classes[tag_name]['start_line'], structure_classes[tag_name]['end_line']]
+                        info = structure_all_funcs.get(tag_name)
+                        if info is not None:
+                            cur_cdl = '\n'.join(info['text'])
+                            line_nums = [info['start_line'], info['end_line']]
+                        else:
+                            # fallback：至少别崩，用 tree-sitter 的位置 + 定义行
+                            line_nums = [node.start_point[0], node.end_point[0]]
+                            cur_cdl = codelines[node.start_point[0]].rstrip('\n')
                     else:
                         line_nums = [node.start_point[0], node.end_point[0]]
+
+
                     result = Tag(
                         idx = self.num_tags,
                         rel_fname=rel_fname,
