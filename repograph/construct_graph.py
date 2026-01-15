@@ -29,7 +29,7 @@ from utils import create_structure
 warnings.simplefilter("ignore", category=FutureWarning)
 from tree_sitter_languages import get_language, get_parser
 
-Tag = namedtuple("Tag", "rel_fname fname line name kind category info".split())
+Tag = namedtuple("Tag", "idx rel_fname fname line name kind category info".split())
 
 
 class CodeGraph:
@@ -96,12 +96,17 @@ class CodeGraph:
         
         G = nx.MultiDiGraph()
         for tag in tags:
-            G.add_node(tag.name, category=tag.category, info=tag.info, fname=tag.fname, line=tag.line, kind=tag.kind)
+            G.add_node(tag.idx, name=tag.name, category=tag.category, info=tag.info, fname=tag.fname, line=tag.line, kind=tag.kind)
 
         for tag in tags:
             if tag.category == 'class':
-                class_funcs = tag.info.split('\t')
+                class_funcs = tag.info.split('\n')
                 for f in class_funcs:
+                    target_nodes = [
+                        n for n, attr in G.nodes(data=True)
+                        if attr.get('name') == f.strip() and attr.get('kind') == 'def'
+                    ]
+                    edges = [(tag.idx, v) for v in target_nodes if v != tag.idx]
                     G.add_edge(tag.name, f.strip())
 
         tags_ref = [tag for tag in tags if tag.kind == 'ref']
@@ -109,7 +114,7 @@ class CodeGraph:
         for tag in tags_ref:
             for tag_def in tags_def:
                 if tag.name == tag_def.name:
-                    G.add_edge(tag.name, tag_def.name)
+                    G.add_edge(tag.idx, tag_def.idx)
         return G
 
     def get_rel_fname(self, fname):
@@ -217,6 +222,8 @@ class CodeGraph:
         ref_fname_lst = rel_fname.split('/')
         s = deepcopy(self.structure)
         for fname_part in ref_fname_lst:
+            if fname_part not in s:
+                return
             s = s[fname_part]
         structure_classes = {item['name']: item for item in s['classes']}
         structure_functions = {item['name']: item for item in s['functions']}
@@ -335,6 +342,7 @@ class CodeGraph:
                     else:
                         line_nums = [node.start_point[0], node.end_point[0]]
                     result = Tag(
+                        idx = self.num_tags,
                         rel_fname=rel_fname,
                         fname=fname,
                         name=tag_name,
@@ -343,9 +351,11 @@ class CodeGraph:
                         info='\n'.join(class_functions), # list unhashable, use string instead
                         line=line_nums,
                     )
+                    self.num_tags += 1
                 else:
                     # If the class is not in structure_classes, we'll create a basic Tag
                     result = Tag(
+                        idx = self.num_tags,
                         rel_fname=rel_fname,
                         fname=fname,
                         name=tag_name,
@@ -354,6 +364,7 @@ class CodeGraph:
                         info="Class not found in structure",
                         line=[node.start_point[0], node.end_point[0]],
                     )
+                    self.num_tags += 1
 
             elif category == 'function':
 
@@ -448,10 +459,10 @@ class CodeGraph:
             
             tags = list(self.get_tags(fname, rel_fname))
 
-            tags_of_files.extend(tags)
-
             if tags is None:
                 continue
+
+            tags_of_files.extend(tags)
 
         return tags_of_files
     
