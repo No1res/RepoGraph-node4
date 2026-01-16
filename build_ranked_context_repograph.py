@@ -6,16 +6,22 @@ import argparse
 import json
 import pickle
 import re
-from collections import defaultdict, deque
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
+import requests
+import faiss
 from transformers import AutoTokenizer
 
-# 使用你给的 RepoGraph 现有 BFS 方法思想：图 + bfs
+# RepoGraph BFS wrapper (uses networkx graph.neighbors internally)
 from repograph.graph_searcher import RepoSearcher
 
 
+# -----------------------------
+# IO helpers
+# -----------------------------
 def read_jsonl(path: str):
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -30,6 +36,9 @@ def load_codereval_index(path: str) -> Dict[str, Dict[str, Any]]:
     return {r["_id"]: r for r in recs}
 
 
+# -----------------------------
+# Parsing / indexing helpers
+# -----------------------------
 def extract_func_name(signature: str) -> Optional[str]:
     m = re.search(r"\bdef\s+([A-Za-z_]\w*)\s*\(", signature)
     return m.group(1) if m else None
@@ -54,7 +63,7 @@ def norm_path(p: str) -> str:
 
 
 def file_match(tag_rel_fname: str, gt_file_path: str) -> bool:
-    # repo 内相对路径可能带 repo_name 前缀/不同层级，做后缀匹配最稳
+    # suffix match is most robust across different relpath conventions
     return norm_path(tag_rel_fname).endswith(norm_path(gt_file_path))
 
 
@@ -86,10 +95,10 @@ def overlap(a: Tuple[int, int], b: Tuple[int, int]) -> bool:
 
 def is_groundtruth_region(tag: Dict[str, Any], gt: Dict[str, Any]) -> bool:
     """
-    更严格的 GT 去除：
-    - 同文件（file_path 后缀匹配）
-    - 并且 tag 的行区间与 [gt.lineno, gt.end_lineno] 重叠（考虑 0/1-based 两种可能）
-    - 或者 info 里包含 def <name>( 也视为 GT 块（兜底）
+    Strict GT removal:
+    - same file (suffix match)
+    - and tag line-range overlaps [gt.lineno, gt.end_lineno] (try both 0/1-based)
+    - OR info contains `def <name>(` as a backstop
     """
     if not file_match(tag.get("rel_fname", ""), gt.get("file_path", "")):
         return False
@@ -102,7 +111,6 @@ def is_groundtruth_region(tag: Dict[str, Any], gt: Dict[str, Any]) -> bool:
     gt_l0 = parse_int(gt.get("lineno"))
     gt_l1 = parse_int(gt.get("end_lineno"))
     if gt_l0 is None or gt_l1 is None:
-        # 没行号就只能按 file+def+name 去除（弱一些）
         return (tag.get("kind") == "def") and (tag.get("name") == name)
 
     gt_range = (min(gt_l0, gt_l1), max(gt_l0, gt_l1))
@@ -110,7 +118,6 @@ def is_groundtruth_region(tag: Dict[str, Any], gt: Dict[str, Any]) -> bool:
     if tr is None:
         return False
 
-    # 你的 tag.line 可能是 0-based 或 1-based；两种都试一次
     if overlap(tr, gt_range):
         return True
     tr_plus1 = (tr[0] + 1, tr[1] + 1)
@@ -120,12 +127,209 @@ def is_groundtruth_region(tag: Dict[str, Any], gt: Dict[str, Any]) -> bool:
     return False
 
 
+# -----------------------------
+# RepoGraph traversal
+# -----------------------------
 def collect_neighbors_bfs(searcher: RepoSearcher, anchor: int, depth: int) -> List[int]:
-    # 直接复用 RepoSearcher.bfs 的语义（返回 visited 列表）
-    # 这里保留顺序：bfs 返回的 visited 是按层次扩展加入的
+    # keep RepoSearcher's BFS order (it uses list queue; order is stable enough)
     return searcher.bfs(anchor, depth)
 
 
+# -----------------------------
+# Embedding + FAISS anchors
+# -----------------------------
+def embed_query(base_url: str, model: str, text: str, timeout: int = 600) -> np.ndarray:
+    """
+    Must match your embedding precompute script:
+      POST /v1/embeddings
+      payload: {"model": model, "input": [text]}
+      response: {"data": [{"embedding":[...], "index":0}, ...]}
+    """
+    url = base_url.rstrip("/") + "/v1/embeddings"
+    payload = {"model": model, "input": [text]}
+    r = requests.post(url, json=payload, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    row = sorted(data["data"], key=lambda x: x["index"])[0]
+    v = np.asarray(row["embedding"], dtype=np.float32)
+    return v
+
+
+def l2_normalize(v: np.ndarray) -> np.ndarray:
+    n = float(np.linalg.norm(v))
+    if n > 0:
+        return v / n
+    return v
+
+
+def last_symbol_name(symbol: str) -> str:
+    # "Server.__init__" -> "__init__"
+    return symbol.split(".")[-1]
+
+
+def load_meta_rows(meta_path: Path) -> List[Dict[str, Any]]:
+    rows = []
+    with meta_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def map_meta_row_to_tag_idxs(
+    meta_row: Dict[str, Any],
+    tags: List[Dict[str, Any]],
+    gt: Dict[str, Any],
+    prefer_kind: str = "def",
+) -> List[int]:
+    """
+    Map embedding snippet (meta row) -> RepoGraph tag.idx (graph node id).
+
+    Strong match:
+      - file suffix match
+      - name match: tag.name == last(meta.symbol)
+      - line overlap (try 0/1-based)
+    Fallback:
+      - file+name match + text containment (meta.text in tag.info or vice versa)
+
+    We also skip candidates that fall inside the GT region (to avoid anchor=GT-only leaf).
+    """
+    fp = meta_row.get("file_path", "")
+    sym = meta_row.get("symbol", "")
+    nm = last_symbol_name(sym)
+
+    sr = parse_int(meta_row.get("start_line"))
+    er = parse_int(meta_row.get("end_line"))
+    meta_range = None
+    if sr is not None and er is not None:
+        meta_range = (min(sr, er), max(sr, er))
+
+    text = meta_row.get("text") or ""
+
+    # pass 1: strict (file + name + overlap)
+    cand: List[int] = []
+    for t in tags:
+        if prefer_kind and t.get("kind") != prefer_kind:
+            continue
+        if not file_match(t.get("rel_fname", ""), fp):
+            continue
+        if t.get("name") != nm:
+            continue
+
+        # skip pygments backfill
+        if t.get("line") == -1:
+            continue
+
+        # skip GT region candidates as anchors
+        if is_groundtruth_region(t, gt):
+            continue
+
+        if meta_range is None:
+            # no line info => accept by file+name
+            cand.append(int(t["idx"]))
+            continue
+
+        tr = tag_line_range(t.get("line"))
+        if tr is None:
+            continue
+
+        if overlap(tr, meta_range) or overlap((tr[0] + 1, tr[1] + 1), meta_range):
+            cand.append(int(t["idx"]))
+
+    if cand:
+        return cand
+
+    # pass 2: text containment fallback (still file+name constrained)
+    cand2: List[int] = []
+    if text:
+        for t in tags:
+            if prefer_kind and t.get("kind") != prefer_kind:
+                continue
+            if not file_match(t.get("rel_fname", ""), fp):
+                continue
+            if t.get("name") != nm:
+                continue
+            if t.get("line") == -1:
+                continue
+            if is_groundtruth_region(t, gt):
+                continue
+            info = t.get("info") or ""
+            if info and (text in info or info in text):
+                cand2.append(int(t["idx"]))
+
+    return cand2
+
+
+def faiss_search_topk(index: faiss.Index, qvec: np.ndarray, topk: int) -> Tuple[List[float], List[int]]:
+    q = qvec.reshape(1, -1).astype(np.float32)
+    D, I = index.search(q, topk)
+    return D[0].tolist(), I[0].tolist()
+
+
+# -----------------------------
+# Fallback to avoid empty/tiny context (still using RepoGraph tags)
+# -----------------------------
+def safe_start_line(tag: Dict[str, Any]) -> int:
+    lr = tag_line_range(tag.get("line"))
+    if lr is None:
+        return 10**9
+    return lr[0]
+
+
+def add_same_file_defs_fallback(
+    ctx_blocks: List[str],
+    ctx_token_lens: List[int],
+    count_tokens,
+    tags: List[Dict[str, Any]],
+    gt: Dict[str, Any],
+    keep_class_blocks: bool,
+    min_ctx_tokens: int,
+    max_defs: int,
+) -> None:
+    used = sum(ctx_token_lens) if ctx_token_lens else sum(count_tokens(b) for b in ctx_blocks)
+    if used >= min_ctx_tokens:
+        return
+
+    gt_file = gt.get("file_path", "")
+
+    cand = []
+    for t in tags:
+        if t.get("kind") != "def":
+            continue
+        if (not keep_class_blocks) and t.get("category") == "class":
+            continue
+        if t.get("line") == -1:
+            continue
+        if not file_match(t.get("rel_fname", ""), gt_file):
+            continue
+        if is_groundtruth_region(t, gt):
+            continue
+        cand.append(t)
+
+    cand.sort(key=safe_start_line)
+
+    added = 0
+    for t in cand:
+        header = f"{t.get('kind')} {t.get('category')} {t.get('name')} | {t.get('rel_fname')} | {t.get('line')}"
+        body = (t.get("info") or "").rstrip()
+        block = header + "\n" + body
+
+        tlen = count_tokens(block)
+        ctx_blocks.append(block)
+        ctx_token_lens.append(tlen)
+        used += tlen
+
+        added += 1
+        if added >= max_defs:
+            break
+        if used >= min_ctx_tokens:
+            break
+
+
+# -----------------------------
+# Main
+# -----------------------------
 def main():
     ap = argparse.ArgumentParser()
 
@@ -143,9 +347,38 @@ def main():
     ap.add_argument("--write_ctx_token_lens", action="store_true",
                     help="also write context_tokens(list[int]) for debugging")
 
+    # leaf/tiny-context fallback (still only from RepoGraph tags)
+    ap.add_argument("--min_ctx_tokens", type=int, default=2000,
+                    help="If context tokens < this, fallback to same-file defs.")
+    ap.add_argument("--fallback_same_file_defs", type=int, default=200,
+                    help="Max number of same-file def blocks to append in fallback.")
+
     # repo_id mapping
     ap.add_argument("--repo_id_style", choices=["slash_to_triple_dash", "basename"], default="slash_to_triple_dash",
                     help="how to map CoderEval 'project' to repo_id file names")
+
+    # anchors mode
+    ap.add_argument("--anchors_mode", choices=["name", "faiss", "faiss_then_name"], default="faiss_then_name",
+                    help="Anchor selection: name (signature) or faiss (embedding topK) or faiss_then_name (fallback).")
+
+    # embeddings + faiss
+    ap.add_argument("--emb_dir", default="embeddings_out",
+                    help="Directory that contains <repo_id>/meta.jsonl")
+    ap.add_argument("--faiss_dir", default="faiss_indexes_flat",
+                    help="Directory that contains <repo_id>.flat.ip.faiss")
+    ap.add_argument("--faiss_topk", type=int, default=3)
+
+    ap.add_argument("--embed_base_url", default="http://127.0.0.1:7269")
+    ap.add_argument("--embed_model", default="", help="Model tag/path for /v1/embeddings (must match precompute).")
+    ap.add_argument("--embed_timeout", type=int, default=600)
+    ap.add_argument("--l2_normalize_query", action="store_true", default=True,
+                    help="L2 normalize query embedding before FAISS search (your vectors are ~unit-norm).")
+
+    # debug
+    ap.add_argument("--write_faiss_debug", action="store_true",
+                    help="Write faiss_topk_meta and faiss_anchor_idxs fields for debugging.")
+    ap.add_argument("--cache_repos", type=int, default=8,
+                    help="Max number of repos to cache in memory (graphs/tags/meta/faiss).")
 
     args = ap.parse_args()
 
@@ -156,6 +389,27 @@ def main():
 
     gt_by_id = load_codereval_index(args.codereval_json)
     graphs_dir = Path(args.graphs_dir)
+
+    emb_dir = Path(args.emb_dir)
+    faiss_dir = Path(args.faiss_dir)
+
+    # Simple in-memory caches keyed by repo_id
+    # Keep small to avoid RAM blow-up on many repos.
+    cache: Dict[str, Dict[str, Any]] = {}
+    cache_order: List[str] = []
+
+    def cache_get(repo_id: str) -> Optional[Dict[str, Any]]:
+        return cache.get(repo_id)
+
+    def cache_put(repo_id: str, obj: Dict[str, Any]) -> None:
+        nonlocal cache_order
+        if repo_id in cache:
+            return
+        cache[repo_id] = obj
+        cache_order.append(repo_id)
+        if len(cache_order) > args.cache_repos:
+            old = cache_order.pop(0)
+            cache.pop(old, None)
 
     with open(args.out_jsonl, "w", encoding="utf-8") as fw:
         for ex in read_jsonl(args.ce_label_jsonl):
@@ -170,38 +424,139 @@ def main():
             else:
                 repo_id = Path(project).name
 
-            graph_path = graphs_dir / f"{repo_id}.pkl"
-            tags_path = graphs_dir / f"tags_{repo_id}.json"
-            if not graph_path.exists() or not tags_path.exists():
-                continue
+            # Load / cache repo assets
+            cached = cache_get(repo_id)
+            if cached is None:
+                graph_path = graphs_dir / f"{repo_id}.pkl"
+                tags_path = graphs_dir / f"tags_{repo_id}.json"
+                if not graph_path.exists() or not tags_path.exists():
+                    continue
 
-            G = pickle.load(open(graph_path, "rb"))
-            tags = json.load(open(tags_path, "r", encoding="utf-8"))
+                G = pickle.load(open(graph_path, "rb"))
+                tags = json.load(open(tags_path, "r", encoding="utf-8"))
+                by_idx, def_index, ref_index = build_indexes(tags)
 
-            by_idx, def_index, ref_index = build_indexes(tags)
+                # Optional FAISS assets
+                meta_rows = None
+                index = None
+                meta_path = emb_dir / repo_id / "meta.jsonl"
+                index_path = faiss_dir / f"{repo_id}.flat.ip.faiss"
+                if meta_path.exists() and index_path.exists():
+                    meta_rows = load_meta_rows(meta_path)
+                    index = faiss.read_index(str(index_path))
+
+                cached = {
+                    "G": G,
+                    "tags": tags,
+                    "by_idx": by_idx,
+                    "def_index": def_index,
+                    "ref_index": ref_index,
+                    "meta_rows": meta_rows,
+                    "faiss_index": index,
+                }
+                cache_put(repo_id, cached)
+
+            G = cached["G"]
+            tags = cached["tags"]
+            by_idx = cached["by_idx"]
+            def_index = cached["def_index"]
+            ref_index = cached["ref_index"]
+            meta_rows = cached.get("meta_rows")
+            faiss_index = cached.get("faiss_index")
 
             signature = ex.get("signature") or ""
             model_input = ex.get("input") or ""
+
             func_name = extract_func_name(signature) or extract_func_name(model_input)
-            if not func_name:
+            # func_name might be None; in faiss mode we can still proceed
+            # but we keep it as search_term for metadata output.
+            search_term = func_name or ""
+
+            anchors: List[int] = []
+            faiss_debug_meta: List[Dict[str, Any]] = []
+            faiss_anchor_idxs: List[int] = []
+
+            # -------------------------
+            # Anchor selection
+            # -------------------------
+            if args.anchors_mode in ("faiss", "faiss_then_name"):
+                # Need embedding service params
+                if not args.embed_model:
+                    # cannot embed => treat as no faiss anchors
+                    pass
+                elif faiss_index is None or meta_rows is None:
+                    # no faiss assets for this repo
+                    pass
+                else:
+                    # Query text is exactly CE input (signature + docstring)
+                    qtext = model_input
+                    qvec = embed_query(args.embed_base_url, args.embed_model, qtext, timeout=args.embed_timeout)
+                    if args.l2_normalize_query:
+                        qvec = l2_normalize(qvec)
+
+                    # dimension check
+                    if getattr(faiss_index, "d", None) is not None and faiss_index.d != qvec.shape[0]:
+                        # dimension mismatch => skip faiss anchors
+                        pass
+                    else:
+                        scores, ids = faiss_search_topk(faiss_index, qvec, args.faiss_topk)
+
+                        # Map each meta hit to tag.idx anchors
+                        mapped: List[int] = []
+                        for score, mid in zip(scores, ids):
+                            if mid < 0 or mid >= len(meta_rows):
+                                continue
+                            mr = meta_rows[mid]
+                            # store debug meta
+                            if args.write_faiss_debug:
+                                faiss_debug_meta.append({
+                                    "score": float(score),
+                                    "file_path": mr.get("file_path"),
+                                    "symbol": mr.get("symbol"),
+                                    "snippet_type": mr.get("snippet_type"),
+                                    "start_line": mr.get("start_line"),
+                                    "end_line": mr.get("end_line"),
+                                    "sha1": mr.get("sha1"),
+                                })
+
+                            # prefer def matches first
+                            idxs = map_meta_row_to_tag_idxs(mr, tags, gt, prefer_kind="def")
+                            if not idxs:
+                                # then allow any kind (ref/def) if def not found
+                                idxs = map_meta_row_to_tag_idxs(mr, tags, gt, prefer_kind="")
+                            mapped.extend(idxs)
+
+                        # dedup preserve order
+                        seen_a = set()
+                        for a in mapped:
+                            if a not in seen_a:
+                                anchors.append(a)
+                                seen_a.add(a)
+
+                        if args.write_faiss_debug:
+                            faiss_anchor_idxs = anchors[:]
+
+            if (not anchors) and args.anchors_mode in ("name", "faiss_then_name"):
+                if func_name:
+                    anchors = def_index.get(func_name, [])
+                    if not anchors:
+                        anchors = ref_index.get(func_name, [])
+                # if still empty => skip (no additional retrieval method)
+
+            if not anchors:
+                # keep “only existing methods”: cannot proceed
                 continue
 
-            anchors = def_index.get(func_name, [])
-            if not anchors:
-                # def 找不到就退化到 ref anchors（仍然是 RepoGraph 图节点）
-                anchors = ref_index.get(func_name, [])
-            if not anchors:
-                # 完全找不到就只能跳过（保持“只用 RepoGraph 方法”，不引入别的检索）
-                continue
-
-            # RepoGraph 检索：BFS on G and BFS on G.reverse
+            # -------------------------
+            # RepoGraph traversal: BFS on G and G.reverse
+            # -------------------------
             searcher_fwd = RepoSearcher(G)
             searcher_bwd = RepoSearcher(G.reverse(copy=False))
 
             visited_order: List[int] = []
             seen = set()
 
-            # 先放 anchors（稳定顺序）
+            # start with anchors
             for a in anchors:
                 if a not in seen:
                     visited_order.append(a)
@@ -217,6 +572,9 @@ def main():
                         visited_order.append(nid)
                         seen.add(nid)
 
+            # -------------------------
+            # Build ranked context blocks
+            # -------------------------
             ctx_blocks: List[str] = []
             ctx_token_lens: List[int] = []
 
@@ -225,22 +583,21 @@ def main():
                 if not t:
                     continue
 
-                # 过滤 pygments backfill 这类 line=-1
+                # skip pygments backfill
                 if t.get("line") == -1:
                     continue
 
-                # 默认丢掉 class blocks：你现在 class 的 info 是 method name 列表，不是代码
                 if (not args.keep_class_blocks) and t.get("category") == "class":
                     continue
 
-                # 去除 ground truth 范围内的任何 tag（def/ref）以防泄漏
+                # remove GT region blocks
                 if is_groundtruth_region(t, gt):
                     continue
 
                 header = f"{t.get('kind')} {t.get('category')} {t.get('name')} | {t.get('rel_fname')} | {t.get('line')}"
                 body = (t.get("info") or "").rstrip()
-
                 block = header + "\n" + body
+
                 ctx_blocks.append(block)
                 if args.write_ctx_token_lens:
                     ctx_token_lens.append(count_tokens(block))
@@ -248,17 +605,40 @@ def main():
                 if len(ctx_blocks) >= args.max_ctx_blocks:
                     break
 
+            # -------------------------
+            # Fallback: same-file defs to avoid empty/tiny context
+            # -------------------------
+            cur_tokens = sum(ctx_token_lens) if args.write_ctx_token_lens else sum(count_tokens(b) for b in ctx_blocks)
+            if cur_tokens < args.min_ctx_tokens:
+                add_same_file_defs_fallback(
+                    ctx_blocks=ctx_blocks,
+                    ctx_token_lens=ctx_token_lens if args.write_ctx_token_lens else [],
+                    count_tokens=count_tokens,
+                    tags=tags,
+                    gt=gt,
+                    keep_class_blocks=args.keep_class_blocks,
+                    min_ctx_tokens=args.min_ctx_tokens,
+                    max_defs=args.fallback_same_file_defs,
+                )
+
             out = {
-                "_id": qid,  # ✅ 对齐你的推理脚本：rec.get("_id")
+                "_id": qid,  # aligns with your inference script
                 "repo_id": repo_id,
                 "project": project,
-                "model_input": model_input,  # ✅ 对齐你的推理脚本：rec.get("model_input")
-                "context": ctx_blocks,        # ✅ List[str]，由你的脚本按 budget 顺序截取
-                "search_term": func_name,
+                "model_input": model_input,
+                "context": ctx_blocks,
+                "search_term": search_term,
                 "depth": args.depth,
+                "anchors_mode": args.anchors_mode,
+                "faiss_topk": args.faiss_topk if args.anchors_mode != "name" else 0,
             }
+
             if args.write_ctx_token_lens:
                 out["context_tokens"] = ctx_token_lens
+
+            if args.write_faiss_debug:
+                out["faiss_topk_meta"] = faiss_debug_meta
+                out["faiss_anchor_idxs"] = faiss_anchor_idxs
 
             fw.write(json.dumps(out, ensure_ascii=False) + "\n")
 
