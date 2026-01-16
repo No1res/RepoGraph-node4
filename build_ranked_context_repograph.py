@@ -59,7 +59,7 @@ def build_indexes(tags: List[Dict[str, Any]]):
 
 
 def norm_path(p: str) -> str:
-    return p.replace("\\", "/").lstrip("./")
+    return (p or "").replace("\\", "/").lstrip("./")
 
 
 def file_match(tag_rel_fname: str, gt_file_path: str) -> bool:
@@ -131,7 +131,7 @@ def is_groundtruth_region(tag: Dict[str, Any], gt: Dict[str, Any]) -> bool:
 # RepoGraph traversal
 # -----------------------------
 def collect_neighbors_bfs(searcher: RepoSearcher, anchor: int, depth: int) -> List[int]:
-    # keep RepoSearcher's BFS order (it uses list queue; order is stable enough)
+    # keep RepoSearcher's BFS order
     return searcher.bfs(anchor, depth)
 
 
@@ -164,7 +164,7 @@ def l2_normalize(v: np.ndarray) -> np.ndarray:
 
 def last_symbol_name(symbol: str) -> str:
     # "Server.__init__" -> "__init__"
-    return symbol.split(".")[-1]
+    return (symbol or "").split(".")[-1]
 
 
 def load_meta_rows(meta_path: Path) -> List[Dict[str, Any]]:
@@ -175,6 +175,12 @@ def load_meta_rows(meta_path: Path) -> List[Dict[str, Any]]:
             if line:
                 rows.append(json.loads(line))
     return rows
+
+
+def faiss_search_topk(index: faiss.Index, qvec: np.ndarray, topk: int) -> Tuple[List[float], List[int]]:
+    q = qvec.reshape(1, -1).astype(np.float32)
+    D, I = index.search(q, topk)
+    return D[0].tolist(), I[0].tolist()
 
 
 def map_meta_row_to_tag_idxs(
@@ -226,7 +232,6 @@ def map_meta_row_to_tag_idxs(
             continue
 
         if meta_range is None:
-            # no line info => accept by file+name
             cand.append(int(t["idx"]))
             continue
 
@@ -261,14 +266,8 @@ def map_meta_row_to_tag_idxs(
     return cand2
 
 
-def faiss_search_topk(index: faiss.Index, qvec: np.ndarray, topk: int) -> Tuple[List[float], List[int]]:
-    q = qvec.reshape(1, -1).astype(np.float32)
-    D, I = index.search(q, topk)
-    return D[0].tolist(), I[0].tolist()
-
-
 # -----------------------------
-# Fallback to avoid empty/tiny context (still using RepoGraph tags)
+# Fallback helpers (token coverage)
 # -----------------------------
 def safe_start_line(tag: Dict[str, Any]) -> int:
     lr = tag_line_range(tag.get("line"))
@@ -307,7 +306,119 @@ def add_same_file_defs_fallback(
             continue
         cand.append(t)
 
-    cand.sort(key=safe_start_line)
+    cand.sort(key=lambda x: (norm_path(x.get("rel_fname", "")), safe_start_line(x)))
+
+    added = 0
+    for t in cand:
+        header = f"{t.get('kind')} {t.get('category')} {t.get('name')} | {t.get('rel_fname')} | {t.get('line')}"
+        body = (t.get("info") or "").rstrip()
+        block = header + "\n" + body
+
+        tlen = count_tokens(block)
+        ctx_blocks.append(block)
+        ctx_token_lens.append(tlen)
+        used += tlen
+
+        added += 1
+        if added >= max_defs:
+            break
+        if used >= min_ctx_tokens:
+            break
+
+
+def add_defs_from_filepaths(
+    ctx_blocks: List[str],
+    ctx_token_lens: List[int],
+    count_tokens,
+    tags: List[Dict[str, Any]],
+    gt: Dict[str, Any],
+    keep_class_blocks: bool,
+    min_ctx_tokens: int,
+    max_defs: int,
+    file_paths: List[str],
+) -> None:
+    """
+    Add def blocks from specified file_paths (e.g., FAISS topK hit file paths).
+    No directory filtering, no block dedup; only removes GT region and line=-1.
+    """
+    used = sum(ctx_token_lens) if ctx_token_lens else sum(count_tokens(b) for b in ctx_blocks)
+    if used >= min_ctx_tokens:
+        return
+
+    cand = []
+    for fp in file_paths:
+        for t in tags:
+            if t.get("kind") != "def":
+                continue
+            if (not keep_class_blocks) and t.get("category") == "class":
+                continue
+            if t.get("line") == -1:
+                continue
+            if not file_match(t.get("rel_fname", ""), fp):
+                continue
+            if is_groundtruth_region(t, gt):
+                continue
+            cand.append(t)
+
+    cand.sort(key=lambda x: (norm_path(x.get("rel_fname", "")), safe_start_line(x)))
+
+    added = 0
+    for t in cand:
+        header = f"{t.get('kind')} {t.get('category')} {t.get('name')} | {t.get('rel_fname')} | {t.get('line')}"
+        body = (t.get("info") or "").rstrip()
+        block = header + "\n" + body
+
+        tlen = count_tokens(block)
+        ctx_blocks.append(block)
+        ctx_token_lens.append(tlen)
+        used += tlen
+
+        added += 1
+        if added >= max_defs:
+            break
+        if used >= min_ctx_tokens:
+            break
+
+
+def add_defs_from_same_dir(
+    ctx_blocks: List[str],
+    ctx_token_lens: List[int],
+    count_tokens,
+    tags: List[Dict[str, Any]],
+    gt: Dict[str, Any],
+    keep_class_blocks: bool,
+    min_ctx_tokens: int,
+    max_defs: int,
+) -> None:
+    """
+    Add def blocks from the same directory as GT file.
+    No directory filtering, no block dedup; only removes GT region and line=-1.
+    """
+    used = sum(ctx_token_lens) if ctx_token_lens else sum(count_tokens(b) for b in ctx_blocks)
+    if used >= min_ctx_tokens:
+        return
+
+    gt_fp = norm_path(gt.get("file_path", ""))
+    gt_dir = "/".join(gt_fp.split("/")[:-1])
+    if not gt_dir:
+        return
+
+    cand = []
+    for t in tags:
+        if t.get("kind") != "def":
+            continue
+        if (not keep_class_blocks) and t.get("category") == "class":
+            continue
+        if t.get("line") == -1:
+            continue
+        rel = norm_path(t.get("rel_fname", ""))
+        if not rel.startswith(gt_dir + "/"):
+            continue
+        if is_groundtruth_region(t, gt):
+            continue
+        cand.append(t)
+
+    cand.sort(key=lambda x: (norm_path(x.get("rel_fname", "")), safe_start_line(x)))
 
     added = 0
     for t in cand:
@@ -328,6 +439,20 @@ def add_same_file_defs_fallback(
 
 
 # -----------------------------
+# Anchor ordering (do not filter out; just reorder)
+# -----------------------------
+BAD_PREFIXES = ("tests/", "test/", "unittests/", "docs/", "doc/", "examples/")
+BAD_EXACT = ("setup.py", "versioneer.py")
+
+
+def is_bad_path(p: str) -> bool:
+    p = norm_path(p)
+    if p in BAD_EXACT:
+        return True
+    return p.startswith(BAD_PREFIXES)
+
+
+# -----------------------------
 # Main
 # -----------------------------
 def main():
@@ -341,17 +466,21 @@ def main():
     ap.add_argument("--tokenizer_path", default="/workspace/models/Qwen3-Coder-30B-A3B-Instruct",
                     help="Qwen3 tokenizer local path")
     ap.add_argument("--depth", type=int, default=2, help="BFS depth (k-hop)")
-    ap.add_argument("--max_ctx_blocks", type=int, default=5000, help="cap number of context blocks per sample")
+    ap.add_argument("--max_ctx_blocks", type=int, default=20000, help="cap number of context blocks per sample")
     ap.add_argument("--keep_class_blocks", action="store_true",
                     help="keep class category blocks (default: drop class blocks because they are method-name lists)")
     ap.add_argument("--write_ctx_token_lens", action="store_true",
                     help="also write context_tokens(list[int]) for debugging")
 
-    # leaf/tiny-context fallback (still only from RepoGraph tags)
-    ap.add_argument("--min_ctx_tokens", type=int, default=2000,
-                    help="If context tokens < this, fallback to same-file defs.")
-    ap.add_argument("--fallback_same_file_defs", type=int, default=200,
-                    help="Max number of same-file def blocks to append in fallback.")
+    # token coverage knobs
+    ap.add_argument("--min_ctx_tokens", type=int, default=30000,
+                    help="Try to reach at least this many tokens of context blocks by adding fallbacks.")
+    ap.add_argument("--fallback_same_file_defs", type=int, default=500,
+                    help="Max def blocks to add from the same file as GT.")
+    ap.add_argument("--fallback_topk_file_defs", type=int, default=2000,
+                    help="Max def blocks to add from FAISS topK hit file_paths.")
+    ap.add_argument("--fallback_same_dir_defs", type=int, default=5000,
+                    help="Max def blocks to add from same directory as GT file.")
 
     # repo_id mapping
     ap.add_argument("--repo_id_style", choices=["slash_to_triple_dash", "basename"], default="slash_to_triple_dash",
@@ -366,7 +495,7 @@ def main():
                     help="Directory that contains <repo_id>/meta.jsonl")
     ap.add_argument("--faiss_dir", default="faiss_indexes_flat",
                     help="Directory that contains <repo_id>.flat.ip.faiss")
-    ap.add_argument("--faiss_topk", type=int, default=3)
+    ap.add_argument("--faiss_topk", type=int, default=5)
 
     ap.add_argument("--embed_base_url", default="http://127.0.0.1:7269")
     ap.add_argument("--embed_model", default="", help="Model tag/path for /v1/embeddings (must match precompute).")
@@ -394,7 +523,6 @@ def main():
     faiss_dir = Path(args.faiss_dir)
 
     # Simple in-memory caches keyed by repo_id
-    # Keep small to avoid RAM blow-up on many repos.
     cache: Dict[str, Dict[str, Any]] = {}
     cache_order: List[str] = []
 
@@ -466,48 +594,45 @@ def main():
 
             signature = ex.get("signature") or ""
             model_input = ex.get("input") or ""
-
             func_name = extract_func_name(signature) or extract_func_name(model_input)
-            # func_name might be None; in faiss mode we can still proceed
-            # but we keep it as search_term for metadata output.
             search_term = func_name or ""
 
             anchors: List[int] = []
             faiss_debug_meta: List[Dict[str, Any]] = []
             faiss_anchor_idxs: List[int] = []
+            topk_file_paths: List[str] = []
 
             # -------------------------
             # Anchor selection
             # -------------------------
             if args.anchors_mode in ("faiss", "faiss_then_name"):
-                # Need embedding service params
-                if not args.embed_model:
-                    # cannot embed => treat as no faiss anchors
-                    pass
-                elif faiss_index is None or meta_rows is None:
-                    # no faiss assets for this repo
-                    pass
-                else:
-                    # Query text is exactly CE input (signature + docstring)
-                    qtext = model_input
+                if args.embed_model and faiss_index is not None and meta_rows is not None:
+                    qtext = model_input  # exactly CE input (signature + docstring)
                     qvec = embed_query(args.embed_base_url, args.embed_model, qtext, timeout=args.embed_timeout)
                     if args.l2_normalize_query:
                         qvec = l2_normalize(qvec)
 
                     # dimension check
-                    if getattr(faiss_index, "d", None) is not None and faiss_index.d != qvec.shape[0]:
-                        # dimension mismatch => skip faiss anchors
-                        pass
-                    else:
+                    if getattr(faiss_index, "d", None) is not None and faiss_index.d == qvec.shape[0]:
                         scores, ids = faiss_search_topk(faiss_index, qvec, args.faiss_topk)
 
-                        # Map each meta hit to tag.idx anchors
-                        mapped: List[int] = []
+                        hits = []
                         for score, mid in zip(scores, ids):
                             if mid < 0 or mid >= len(meta_rows):
                                 continue
                             mr = meta_rows[mid]
-                            # store debug meta
+                            fp0 = mr.get("file_path", "")
+                            hits.append((float(score), int(mid), fp0, mr))
+
+                        # Reorder: good paths first, bad paths later (no filtering)
+                        good = [h for h in hits if not is_bad_path(h[2])]
+                        bad = [h for h in hits if is_bad_path(h[2])]
+                        ordered = good + bad
+
+                        mapped: List[int] = []
+                        for score, mid, fp0, mr in ordered:
+                            topk_file_paths.append(fp0)
+
                             if args.write_faiss_debug:
                                 faiss_debug_meta.append({
                                     "score": float(score),
@@ -519,10 +644,8 @@ def main():
                                     "sha1": mr.get("sha1"),
                                 })
 
-                            # prefer def matches first
                             idxs = map_meta_row_to_tag_idxs(mr, tags, gt, prefer_kind="def")
                             if not idxs:
-                                # then allow any kind (ref/def) if def not found
                                 idxs = map_meta_row_to_tag_idxs(mr, tags, gt, prefer_kind="")
                             mapped.extend(idxs)
 
@@ -541,7 +664,7 @@ def main():
                     anchors = def_index.get(func_name, [])
                     if not anchors:
                         anchors = ref_index.get(func_name, [])
-                # if still empty => skip (no additional retrieval method)
+                # else: keep empty
 
             if not anchors:
                 # keep “only existing methods”: cannot proceed
@@ -606,9 +729,10 @@ def main():
                     break
 
             # -------------------------
-            # Fallback: same-file defs to avoid empty/tiny context
+            # Coverage boosting (no filtering; just add more defs)
             # -------------------------
             cur_tokens = sum(ctx_token_lens) if args.write_ctx_token_lens else sum(count_tokens(b) for b in ctx_blocks)
+
             if cur_tokens < args.min_ctx_tokens:
                 add_same_file_defs_fallback(
                     ctx_blocks=ctx_blocks,
@@ -619,6 +743,33 @@ def main():
                     keep_class_blocks=args.keep_class_blocks,
                     min_ctx_tokens=args.min_ctx_tokens,
                     max_defs=args.fallback_same_file_defs,
+                )
+                cur_tokens = sum(ctx_token_lens) if args.write_ctx_token_lens else sum(count_tokens(b) for b in ctx_blocks)
+
+            if cur_tokens < args.min_ctx_tokens and topk_file_paths:
+                add_defs_from_filepaths(
+                    ctx_blocks=ctx_blocks,
+                    ctx_token_lens=ctx_token_lens if args.write_ctx_token_lens else [],
+                    count_tokens=count_tokens,
+                    tags=tags,
+                    gt=gt,
+                    keep_class_blocks=args.keep_class_blocks,
+                    min_ctx_tokens=args.min_ctx_tokens,
+                    max_defs=args.fallback_topk_file_defs,
+                    file_paths=topk_file_paths,
+                )
+                cur_tokens = sum(ctx_token_lens) if args.write_ctx_token_lens else sum(count_tokens(b) for b in ctx_blocks)
+
+            if cur_tokens < args.min_ctx_tokens:
+                add_defs_from_same_dir(
+                    ctx_blocks=ctx_blocks,
+                    ctx_token_lens=ctx_token_lens if args.write_ctx_token_lens else [],
+                    count_tokens=count_tokens,
+                    tags=tags,
+                    gt=gt,
+                    keep_class_blocks=args.keep_class_blocks,
+                    min_ctx_tokens=args.min_ctx_tokens,
+                    max_defs=args.fallback_same_dir_defs,
                 )
 
             out = {
