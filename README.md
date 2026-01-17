@@ -1,61 +1,132 @@
-# RepoGraph: Enhancing AI Software Engineering with Repository-level Code Graph
+# RepoGraph Customizations (What We Changed)
 
-## 📜 Overview
+This document summarizes all modifications made during our adaptation of RepoGraph for CoderEval-style context building and long-context budget studies.
 
-We introduce RepoGraph, an effective plug-in repo-level module that offers the desired context and substantially boosts the LLMs' AI software engineering capability.
+---
 
-## 🆕 News
+## 1) Graph Construction Changes (`repograph/construct_graph.py`)
 
-We released the first version RepoGraph and its integration with [SWE-bench](https://www.swebench.com/) methods!
+### 1.1 Line-level node identity via `idx`
+- Extended `Tag` to include a unique integer id:
+  - `Tag(idx, rel_fname, fname, line, name, kind, category, info)`
+- Graph nodes are keyed by `tag.idx` (not by `tag.name`).
+- Node attributes store `name/kind/category/rel_fname/line/info`.
+- **Why:** avoids cross-file name collisions (same function name in multiple files previously merged into one node).
 
-## 🤖 Code Setup
+### 1.2 Robust `get_tags_raw` (prevent `KeyError` on missing structure entries)
+- Replaced hard indexing:
+  - `structure_all_funcs[tag_name]`
+- With safe lookup + fallback:
+  - `info = structure_all_funcs.get(tag_name)`; if missing, fallback to minimal snippet/line.
+- **Why:** some repos have functions captured by tree-sitter but absent from the AST-derived structure (previously caused crashes like `KeyError: get_auth`).
 
-### Foder and files
+### 1.3 Fix root-level `.py` files (e.g., `setup.py`) not producing tags
+- Root cause: `create_structure()` stores root files under `structure[repo_name][file]`, while `get_tags_raw()` originally indexed from the top level using `rel_fname` directly.
+- Fix: when `len(ref_fname_lst) == 1`, first step into `structure[repo_name]` before indexing the file.
+- **Why:** ensures root-level files are parsed and appear in tags/graph; required for embedding-meta → RepoGraph tag mapping (Issue #18 aligned).
 
-`repograph` contains the code for construct and retrieve related context from the graph. 
+### 1.4 Directory filtering in file discovery (reduce noise + speedup)
+- Updated `find_src_files()` to skip:
+  - `.git`, `__pycache__`, `venv/.venv`, `site-packages`, `dist-packages`, `node_modules`, etc.
+- **Why:** prevents third-party/env code from polluting the graph and dramatically reduces runtime and warnings.
 
-`agentless` and `SWE-agent` incorporates the integrated version of RepoGraph with the two methods.
+### 1.5 Misc correctness fixes
+- Ensure `self.num_tags = 0` is initialized and incremented for every yielded tag (including fallback refs).
+- Fix namedtuple access patterns (use `tag.name`, not `tag['name']`).
+- Align class method list parsing (`info` uses `\n` join → split by `\n`).
+- Fix class→method edges to use `idx` ids (not raw names).
 
-Currently this version may take a little long time to run for a repo. We provide a cached version for all repos in SWE-bench, download it from [huggingface datasets](https://huggingface.co/datasets/MrZilinXiao/RepoGraph) or [Google Drive](https://drive.google.com/file/d/1-0d-OgGoOf3i54bWcf8H0egjQyTSZ8dG/view?usp=sharing) and put it under `repo_structures`.
+---
 
-### How to run?
+## 2) Context Dataset Builder (`build_ranked_context_repograph.py`)
 
-To generate the repograph for a given repository, simply run:
+Goal: generate a ranked context dataset (`jsonl`) compatible with our inference script:
+- Required fields: `"_id"`, `"model_input"`, `"context"` (list of blocks)
 
-```bash
-python ./repograph/construct_graph.py <dir_to_repo>
-```
+### 2.1 Output schema aligned to inference script
+Each output line contains:
+- `_id`: question id
+- `repo_id`, `project`
+- `model_input`: `signature + docstring` input from `CEPythonHumanLabel.jsonl`
+- `context`: `List[str]` (ranked blocks)
+- `depth`, `anchors_mode`, `faiss_topk`
+- Optional debug: `faiss_topk_meta`, `faiss_anchor_idxs`
+- Optional debug: `context_tokens` if enabled
 
-This will produce two files, `tags_{instance_id}.jsonl` stores the line-level information and `{instance_id}.pkl` is the graph constructed using networkx.
+### 2.2 Strict GroundTruth removal (no leakage)
+We remove any context blocks overlapping the GT region:
+- Same file (suffix match with `file_path`)
+- Line overlap with `[lineno, end_lineno]` (0/1-based tolerance)
+- Backstop: contains `def <name>(`
+Verified by **TRUE leak check** (same file + `def <name>(`): `true leak count = 0`.
 
-## Integration with models on SWE-bench
+### 2.3 FAISS/Embedding anchors (TopK → RepoGraph BFS expansion)
+Added `anchors_mode=faiss_then_name`:
+1. Build query embedding using OpenAI-compatible embeddings endpoint:
+   - `POST /v1/embeddings` with Qwen3-Embedding-4B
+2. Search repo-local FAISS index (`repo_id.flat.ip.faiss`) for topK hits
+3. Map `meta.jsonl` rows to RepoGraph `tag.idx` anchors using:
+   - file suffix match + `symbol → last segment name` + line overlap (+ text containment fallback)
+4. Expand context via RepoGraph graph traversal:
+   - BFS on `G` and BFS on `G.reverse()` (incoming callers)
+5. If FAISS anchors fail, fallback to name anchors (signature-derived def/ref).
 
-### Procedural framework
+### 2.4 Anchor ordering (no filtering; only reordering)
+To reduce “tests/versioneer” dominance without excluding content:
+- Reorder topK hits so “good paths” are processed first and “bad paths” later:
+  - bad prefixes: `tests/`, `test/`, `unittests/`, `docs/`, `examples/`
+  - bad exact: `setup.py`, `versioneer.py`
+- **No blocks are removed**, only anchor priority changes.
+Effect: bad-path top1 ratio reduced significantly (≈19% → ≈6.6% in our 200k pool).
 
-For a procedural framework, RepoGraph could be integrated into every step of the pipeline. Refer to `--repo_graph` hyperparameter for controllability in different stages.
+### 2.5 Multi-stage fallback to increase token coverage
+To avoid empty/tiny context (leaf functions) and support long budgets:
+1. Same-file defs fallback (GT file)
+2. TopK-hit files defs fallback (from FAISS file paths)
+3. Same-directory defs fallback (GT file’s folder)
+Controlled by:
+- `--min_ctx_tokens`
+- `--fallback_same_file_defs`
+- `--fallback_topk_file_defs`
+- `--fallback_same_dir_defs`
+This enabled near-200k candidate pools (p99 ≈ 200k tokens in sampled evaluation).
 
-To run RepoGraph with Agentless, use command:
+---
 
-```bash
-bash run_repograph_agentless.sh
-```
+## 3) Quality Evaluation Commands / Metrics
 
-### Agent framework
+We used a one-shot Python3 checker to validate:
+- JSON validity
+- Coverage: input count vs output count + missing ids
+- Context block counts distribution
+- TRUE GT leak check (same file + `def <name>(`)
+- FAISS diagnostics:
+  - empty anchor ratio
+  - top1 path distribution + bad-path ratio
+- Token distribution (Qwen3-Coder tokenizer, add_special_tokens=False)
 
-To integrate RepoGraph with agent framework such as SWE-agent, we simply add an extra action in its initial action space. Specifically, you can look up for `search_repo()` in corresponding dir. The signature is defined as:
+---
 
-```python
-search_repo:
-    docstring: searches in the current repository with a specific function or class, and returns the def and ref relations for the search term.
-    signature: search_repo <search_term>
-    arguments:
-      - search_term (string) [required]: function or class to look for in the repository.
-```
+## 4) Infrastructure Alignment (vLLM)
 
-To run RepoGraph with SWE-agent, use command:
+### 4.1 Embedding service (Qwen3-Embedding-4B)
+- Served via vLLM OpenAI-compatible `/v1/embeddings`
+- Verified:
+  - embedding dimension matches FAISS index `d` and `embeddings.npy` shape
+  - vectors are L2-normalized (norm ≈ 1), so IP index behaves like cosine
 
-```bash
-bash run_repograph_sweagent.sh
-```
+### 4.2 Generation service (Qwen3-30B-A3B-Instruct-2507)
+- Served via vLLM OpenAI-compatible `/v1/chat/completions`
+- Recommended for reproducibility:
+  - `--generation-config vllm` to avoid HF generation_config overriding defaults
+  - `--served-model-name` aligned with client `--model` field
 
-We are working on prepreints for details in RepoGraph and a more comprehensive/easy integration with exsiting models. Stay tuned!!
+---
+
+## 5) Summary of Key Outcomes
+- Stable graph construction (no crashes on missing structure entries)
+- Root-level files now included in tags/graph (mapping from embedding meta works)
+- FAISS anchors integrated with RepoGraph BFS expansion
+- Strict GT removal verified (`true leak count = 0`)
+- Candidate pool scaled to long-context budgets (200k-ready)
+- Bad-path dominance reduced by anchor reordering (without excluding content)
